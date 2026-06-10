@@ -1,0 +1,16 @@
+{
+  "default_models": [
+    "mean_log",
+    "ridge_svd",
+    "elasticnet_svd",
+    "lightgbm",
+    "xgboost",
+    "catboost"
+  ],
+  "optional_models": [
+    "tabpfn"
+  ],
+  "allowed_seeds": [114, 514, 1919180, 810, 114514],
+  "primary_metric": "rmsle",
+  "target_transform": "log1p"
+}
