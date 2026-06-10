@@ -70,6 +70,70 @@ def make_folds(y_log: np.ndarray, n_splits: int, seed: int):
     return list(splitter.split(np.zeros_like(y_log)))
 
 
+
+
+def make_log_clip_bounds(y_log_reference: np.ndarray) -> tuple[float, float, float]:
+    """Return robust lower/upper/median bounds for log-space predictions.
+
+    The bounds are estimated from the training target of the current fold.
+    This prevents extremely large model outputs from overflowing inside expm1().
+    """
+    ref = np.asarray(y_log_reference, dtype=np.float64)
+    ref = ref[np.isfinite(ref)]
+
+    if ref.size == 0:
+        return 0.0, 30.0, 0.0
+
+    log_min = float(np.nanpercentile(ref, 0.1) - 1.0)
+    log_max = float(np.nanpercentile(ref, 99.9) + 1.0)
+    log_med = float(np.nanmedian(ref))
+
+    if not np.isfinite(log_min):
+        log_min = 0.0
+    if not np.isfinite(log_max):
+        log_max = 30.0
+    if not np.isfinite(log_med):
+        log_med = 0.0
+
+    # np.expm1 overflows around 709 for float64. Keep a safety margin.
+    log_min = max(log_min, -700.0)
+    log_max = min(log_max, 700.0)
+
+    if log_min > log_max:
+        log_min, log_max = log_max, log_min
+
+    return log_min, log_max, log_med
+
+
+def sanitize_log_predictions(
+    y_log_pred: np.ndarray,
+    y_log_reference: np.ndarray,
+    logger=None,
+    context: str = "",
+) -> np.ndarray:
+    """Replace non-finite log predictions and clip outliers before inverse_log_target()."""
+    log_min, log_max, log_med = make_log_clip_bounds(y_log_reference)
+
+    pred = np.asarray(y_log_pred, dtype=np.float64)
+    nonfinite_count = int((~np.isfinite(pred)).sum())
+    finite_mask = np.isfinite(pred)
+    clipped_count = int(((pred[finite_mask] < log_min) | (pred[finite_mask] > log_max)).sum())
+
+    pred = np.nan_to_num(pred, nan=log_med, posinf=log_max, neginf=log_min)
+    pred = np.clip(pred, log_min, log_max)
+
+    if logger is not None and (nonfinite_count or clipped_count):
+        logger.warning(
+            "%s sanitized log predictions: nonfinite=%s, clipped=%s, bounds=[%.6g, %.6g]",
+            context,
+            nonfinite_count,
+            clipped_count,
+            log_min,
+            log_max,
+        )
+
+    return pred
+
 def model_metric_row(model_name, fold, split, y_true, pred):
     row = {"model": model_name, "fold": int(fold), "split": split}
     row.update(regression_metrics(y_true, pred))
@@ -134,8 +198,19 @@ def train_cv_model(
             early_stopping_rounds=args.early_stopping_rounds,
         )
 
-        valid_log = np.asarray(model.predict(X_valid), dtype=np.float64)
-        train_log = np.asarray(model.predict(X_train), dtype=np.float64)
+        fold_y_log = y_log[train_idx]
+        valid_log = sanitize_log_predictions(
+            model.predict(X_valid),
+            fold_y_log,
+            logger=logger,
+            context=f"[{model_name}] fold {fold} valid",
+        )
+        train_log = sanitize_log_predictions(
+            model.predict(X_train),
+            fold_y_log,
+            logger=logger,
+            context=f"[{model_name}] fold {fold} train",
+        )
         oof_log[valid_idx] = valid_log
 
         valid_pred = inverse_log_target(valid_log)
@@ -156,7 +231,12 @@ def train_cv_model(
 
         if test_df is not None and args.predict_test_from_folds:
             X_test = processor.transform(test_df)
-            test_log = np.asarray(model.predict(X_test), dtype=np.float64)
+            test_log = sanitize_log_predictions(
+                model.predict(X_test),
+                fold_y_log,
+                logger=logger,
+                context=f"[{model_name}] fold {fold} test",
+            )
             test_log_folds.append(test_log)
 
         if args.save_models:
@@ -165,11 +245,23 @@ def train_cv_model(
         del X_train, X_valid, model
         gc.collect()
 
+    oof_log = sanitize_log_predictions(
+        oof_log,
+        y_log,
+        logger=logger,
+        context=f"[{model_name}] oof",
+    )
     oof_pred = inverse_log_target(oof_log)
 
     test_pred = None
     if test_df is not None and test_log_folds:
-        test_pred = inverse_log_target(np.mean(np.vstack(test_log_folds), axis=0))
+        test_log_mean = sanitize_log_predictions(
+            np.mean(np.vstack(test_log_folds), axis=0),
+            y_log,
+            logger=logger,
+            context=f"[{model_name}] test mean",
+        )
+        test_pred = inverse_log_target(test_log_mean)
 
     return {
         "model": model_name,
@@ -218,8 +310,22 @@ def run_pca_sweep(train_df, feature_cols, args, folds, logger) -> list[dict]:
             )
             model.fit(X_train, y_log[train_idx])
 
-            train_pred = inverse_log_target(model.predict(X_train))
-            valid_pred = inverse_log_target(model.predict(X_valid))
+            fold_y_log = y_log[train_idx]
+            train_log = sanitize_log_predictions(
+                model.predict(X_train),
+                fold_y_log,
+                logger=logger,
+                context=f"[pca_sweep] n_components={safe_components} fold {fold} train",
+            )
+            valid_log = sanitize_log_predictions(
+                model.predict(X_valid),
+                fold_y_log,
+                logger=logger,
+                context=f"[pca_sweep] n_components={safe_components} fold {fold} valid",
+            )
+
+            train_pred = inverse_log_target(train_log)
+            valid_pred = inverse_log_target(valid_log)
 
             for split, idx, pred in [
                 ("train", train_idx, train_pred),
